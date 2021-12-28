@@ -1,0 +1,121 @@
+---
+title: "gtfs cut vertices"
+author: "Ido Klein"
+date: "28/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(lwgeom)
+library(sfnetworks)
+library(tidygraph)
+library(gtfstools)
+library(mapview)
+library(nngeo)
+Sys.setlocale(locale = "hebrew")
+```
+
+## loading gtfs from 7.7.2021 (takes a while)
+```{r}
+spo_gtfs <- read_gtfs("D:/Downloads/gtfs.zip",encoding = "UTF-8")
+```
+
+## creating lines
+```{r}
+lines <- spo_gtfs$routes %>% 
+  # at first, only for Dan Beer sheva
+  filter(agency_id == 32) %>% 
+  select(route_id,route_desc) %>% 
+  # join with trips
+  left_join(spo_gtfs$trips, by = "route_id") %>% 
+  # get only distinct values
+  select(route_desc,shape_id) %>% 
+  distinct() %>% 
+  # join with shapes
+  left_join(spo_gtfs$shapes, by = "shape_id") %>% 
+  # arrange points in each line by sequence 
+  arrange(route_desc,shape_id,shape_pt_sequence) %>% 
+  # create linestring for each line
+  group_by(route_desc,shape_id) %>% 
+  nest() %>% 
+  mutate(line = st_sfc(map(data, ~.x %>% 
+                      select(shape_pt_lon ,shape_pt_lat) %>%
+                      as.matrix() %>% 
+                      st_linestring() ),crs=4326),
+         # transform to ITM
+         line = st_transform(line,2039)) %>% 
+  select(-data) %>% 
+  ungroup() %>% 
+  st_sf()
+m1 <- mapview(lines,zcol = "route_desc")
+m1@map
+```
+## create intersections between lines
+
+```{r}
+intersections <- 
+  # explode all lines
+  st_segments(lines$line) %>% 
+  st_as_sf() %>% 
+  # get only distinct segments
+  distinct() %>% 
+  # parse as sfnetoworks object
+  as_sfnetwork() %>% 
+  # subdivide segments that intersect (assuming planar graph)
+  convert(to_spatial_subdivision) %>% 
+  # smooth useless nodes
+  convert(to_spatial_smooth) %>% 
+  st_as_sf() 
+m2 <- mapview(intersections)
+m2@map
+```
+
+## get relvant stops
+```{r}
+stops_routes <- spo_gtfs$routes %>% 
+  # at first, only for Dan Beer sheva
+  filter(agency_id == 32) %>% 
+  # join change until getting to stops
+  left_join(spo_gtfs$trips, by = "route_id") %>% 
+  left_join(spo_gtfs$stop_times, by = "trip_id") %>% 
+  left_join(spo_gtfs$stops,by = "stop_id") %>% 
+  # get only distinct stops per line
+  select(route_id,route_desc,shape_id,stop_id,stop_sequence,stop_lat,stop_lon)  %>% 
+  distinct() %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+  st_transform(2039)
+m3 <- mapview(stops_routes,zcol = "route_desc")
+m3@map
+```
+
+## create makats
+```{r}
+makats <- lines$route_desc
+```
+
+## demonstrate on first makat
+```{r}
+map(makats[1],function(x){
+  line <- lines %>% filter(route_desc == x)
+  stops <- stops_routes %>% filter(route_desc == x)
+  line %>% 
+    as_sfnetwork() %>% 
+    st_network_blend(stops,10) %>% 
+    st_network_blend(stops_routes,10) %>% 
+    st_network_blend(intersections,0.1)
+}) %>% 
+  `[[`(1) -> line_with_all_cuts
+line_with_all_cuts %>% activate(nodes) %>% st_as_sf() -> cuts
+line_with_all_cuts %>% activate(edges) %>% st_as_sf() -> liness
+m4 <- mapview(cuts,col.regions = "orange")
+m5 <- mapview(liness)
+m6 <- mapview(intersections,col.regions = "yellow")
+m7 <- mapview(stops_routes,col.regions = "blue")
+m8 <-  m5+m6+m7 + m4
+
+m8@map
+```
+
