@@ -7,23 +7,37 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+```
+## packages and definations
+piping and data manipulation - {tidyverse}
+geometry manipulation - {sf}, {lwgeom}, {nngeo}
+network analysis - {sfnetworks}, {tidygraph}
+gtfs loading - {gtfstools}
+visualization - {mapview}
+hebrew encoding
+```{r message=FALSE, warning=FALSE}
 library(tidyverse)
 library(sf)
 library(lwgeom)
+library(nngeo)
 library(sfnetworks)
 library(tidygraph)
 library(gtfstools)
 library(mapview)
-library(nngeo)
 Sys.setlocale(locale = "hebrew")
 ```
 
 ## loading gtfs from 7.7.2021 (takes a while)
+The {gtfstools} package allows for loading of an entire gtfs file. 
+it takes a while but it is worthwhile because it is more clean.  
+in this stage, we perform the analysis on beersheva only
 ```{r}
 spo_gtfs <- read_gtfs("D:/Downloads/gtfs.zip",encoding = "UTF-8")
 ```
 
 ## creating lines
+using the routes, trips and shapes, we create a geometry for each line makat.  
+we transform the goemetry from wgs84 to ITM.
 ```{r}
 lines <- spo_gtfs$routes %>% 
   # at first, only for Dan Beer sheva
@@ -54,7 +68,15 @@ m1 <- mapview(lines,zcol = "route_desc")
 m1@map
 ```
 ## create intersections between lines
-
+intersections points between the lines are created by:  
+1. exploding all of the lines above to segments  
+2. subsetting to only distinct segments  
+3. parsing all distinct segments to a spatial network, that includes edges and nodes  
+the nodes are one source for intersections, however some of them are irrelevant (see stage 5)
+4. adding intersections that are created by intersection of two segments without a connecting node.  
+this is somewhat problematic because it assumes we deal with a planar graph, and that means that bridges and tunnels will subdived segments.  
+5. smoothing segments - removing nodes that are connected to only 2 edges, making more uniform edges.  
+this eliminates nodes that were created in the lines explosion and are irrelevant for the analysis. 
 ```{r}
 intersections <- 
   # explode all lines
@@ -73,7 +95,8 @@ m2 <- mapview(intersections)
 m2@map
 ```
 
-## get relvant stops
+## get relevant stops
+using the routes, trips, stop_times and stops tables, we create a layer where each stop connected to its line makat and to its place in the stops sequence. 
 ```{r}
 stops_routes <- spo_gtfs$routes %>% 
   # at first, only for Dan Beer sheva
@@ -92,13 +115,26 @@ m3@map
 ```
 
 ## create makats
+get all line makats in order to iterate over the lines and stop_routes
 ```{r}
 makats <- lines$route_desc
 ```
 
-## demonstrate on first makat
+## cutting the line
+using [st_network_blend](https://luukvdmeer.github.io/sfnetworks/reference/st_network_blend.html) as the main workhorse
+
+![](https://luukvdmeer.github.io/sfnetworks/reference/st_network_blend-1.png)
+for each line makat:
+  get line
+  get stops along route
+  transform line to spatial network
+  blend stops along route (first order segments) to spatial network using 10 meter snapping tolarance 
+  blend other stops  (first order segments) using 10 meter snapping tolarance 
+  blend intersections using 0.1 meter snapping tolerance 
+in the map, we see the cuts in orange, the segments in light blue, the intersections in yellow and the stops in blue. you can turn the layers on and off to check the result. 
 ```{r}
-map(makats[1],function(x){
+line_with_all_cuts <- map(makats,function(x){
+  print(x)
   line <- lines %>% filter(route_desc == x)
   stops <- stops_routes %>% filter(route_desc == x)
   line %>% 
@@ -106,10 +142,10 @@ map(makats[1],function(x){
     st_network_blend(stops,10) %>% 
     st_network_blend(stops_routes,10) %>% 
     st_network_blend(intersections,0.1)
-}) %>% 
-  `[[`(1) -> line_with_all_cuts
-line_with_all_cuts %>% activate(nodes) %>% st_as_sf() -> cuts
-line_with_all_cuts %>% activate(edges) %>% st_as_sf() -> liness
+})
+# vis of example
+line_with_all_cuts[[3]] %>% activate(nodes) %>% st_as_sf() -> cuts
+line_with_all_cuts[[3]] %>% activate(edges) %>% st_as_sf() -> liness
 m4 <- mapview(cuts,col.regions = "orange")
 m5 <- mapview(liness)
 m6 <- mapview(intersections,col.regions = "yellow")
@@ -119,3 +155,10 @@ m8 <-  m5+m6+m7 + m4
 m8@map
 ```
 
+## limitations
+only beer sheva
+needs snapping parameter for type 2 segments
+doesnt account for directions in snapping type 2 segments
+## next steps
+creating tables
+discussing joining different GTFSs
