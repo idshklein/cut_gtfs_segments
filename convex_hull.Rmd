@@ -1,0 +1,203 @@
+---
+title: "gtfs cut vertices"
+author: "Ido Klein"
+date: "09/01/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## packages and definations  
+piping and data manipulation - {tidyverse}  
+geometry manipulation - {sf}, {lwgeom}, {nngeo}  
+network analysis - {sfnetworks}, {tidygraph}  
+gtfs loading - {gtfstools}  
+visualization - {mapview}  
+hebrew encoding  
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(lwgeom)
+library(nngeo)
+library(sfnetworks)
+library(tidygraph)
+library(gtfstools)
+library(mapview)
+Sys.setlocale(locale = "hebrew")
+```
+
+## loading gtfs from 7.7.2021 (takes a while)  
+The {gtfstools} package allows for loading of an entire gtfs file. 
+it takes a while but it is worthwhile because it is more clean.  
+in this stage, we perform the analysis on beersheva only  
+```{r}
+spo_gtfs <- read_gtfs("D:/Downloads/gtfs.zip",encoding = "UTF-8")
+```
+
+## beer sheva convex hull polygon  
+filter all routes operated by dan beersheva  
+join trips, stop times and stops coords  
+create a multipoint enttity  
+convex hull  
+
+```{r}
+bs_pol <- spo_gtfs$routes %>% 
+  # at first, only for Dan Beer sheva
+  filter(agency_id == 32) %>% 
+  select(route_id,route_desc) %>% 
+  # join with trips
+  left_join(spo_gtfs$trips, by = "route_id") %>% 
+  left_join(spo_gtfs$stop_times, by = "trip_id") %>% 
+  distinct(stop_id) %>% 
+  left_join(spo_gtfs$stops, by = "stop_id") %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+  st_transform(2039) %>% 
+  summarise() %>% 
+  st_convex_hull() 
+```
+
+
+
+## creating lines that go through beersheva  
+first, we filter only shapes that go through bs_pol 
+we take all distinct shape_id and join them to trips,routes, and back to shapes  
+we create a geometry for each line makat.  
+we transform the geometry from wgs84 to ITM.  
+ 
+```{r}
+lines <- spo_gtfs$shapes %>% 
+  st_as_sf(coords =c("shape_pt_lon" ,"shape_pt_lat"),crs=4326) %>% 
+  st_transform(2039) %>% 
+  filter(st_intersects(geometry,bs_pol,sparse = F)) %>% 
+  st_drop_geometry() %>% 
+  distinct(shape_id) %>% 
+  # join with trips
+  left_join(spo_gtfs$trips, by = "shape_id") %>% 
+  left_join(spo_gtfs$routes, by = "route_id") %>% 
+  left_join(spo_gtfs$shapes, by = "shape_id") %>% 
+  select(route_id,route_desc,shape_id,shape_pt_sequence,shape_pt_lon ,shape_pt_lat) %>% 
+  distinct() %>% 
+  # arrange points in each line by sequence 
+  arrange(route_desc,shape_id,shape_pt_sequence) %>% 
+  # create linestring for each line
+  group_by(route_desc,shape_id) %>% 
+  nest() %>% 
+  mutate(line = st_sfc(map(data, ~.x %>% 
+                      select(shape_pt_lon ,shape_pt_lat) %>%
+                      as.matrix() %>% 
+                      st_linestring() ),crs=4326),
+         # transform to ITM
+         line = st_transform(line,2039)) %>% 
+  select(-data) %>% 
+  ungroup() %>% 
+  st_sf() 
+m1 <- mapview(lines,zcol = "route_desc")
+m1@map
+```
+## create intersections between lines  
+intersections points between the lines are created by:  
+1. exploding all of the lines above to segments  
+2. subsetting to only distinct segments  
+3. parsing all distinct segments to a spatial network, that includes edges and nodes  
+the nodes are one source for intersections, however some of them are irrelevant (see stage 5)  
+4. adding intersections that are created by intersection of two segments without a connecting node.  
+this is somewhat problematic because it assumes we deal with a planar graph, and that means that bridges and tunnels will subdived segments.  
+5. smoothing segments - removing nodes that are connected to only 2 edges, making more uniform edges.  
+this eliminates nodes that were created in the lines explosion and are irrelevant for the analysis. 
+```{r}
+intersections <- 
+  # explode all lines
+  st_segments(lines$line) %>% 
+  st_as_sf() %>% 
+  # get only distinct segments
+  distinct() %>% 
+  # parse as sfnetoworks object
+  as_sfnetwork() %>% 
+  # subdivide segments that intersect (assuming planar graph)
+  convert(to_spatial_subdivision) %>% 
+  # smooth useless nodes
+  convert(to_spatial_smooth) %>% 
+  st_as_sf() 
+m2 <- mapview(intersections)
+m2@map
+```
+
+## get relevant stops  
+using the routes, trips, stop_times and stops tables, we create a layer where each stop connected to its line makat and to its place in the stops sequence. 
+```{r}
+stops_routes <- spo_gtfs$routes %>% 
+  # at first, only for Dan Beer sheva
+  filter(route_desc %in% unique(lines$route_desc)) %>% 
+  # join change until getting to stops
+  left_join(spo_gtfs$trips, by = "route_id") %>% 
+  left_join(spo_gtfs$stop_times, by = "trip_id") %>% 
+  left_join(spo_gtfs$stops,by = "stop_id") %>% 
+  # get only distinct stops per line
+  select(route_id,route_desc,shape_id,stop_id,stop_sequence,stop_lat,stop_lon)  %>% 
+  distinct() %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+  st_transform(2039)
+m3 <- mapview(stops_routes,zcol = "route_desc")
+m3@map
+```
+
+## create makats  
+get all line makats in order to iterate over the lines and stop_routes  
+```{r}
+makats <- lines$route_desc
+```
+
+## cutting the line  
+using [st_network_blend](https://luukvdmeer.github.io/sfnetworks/reference/st_network_blend.html) as the main workhorse  
+
+![](https://luukvdmeer.github.io/sfnetworks/reference/st_network_blend-1.png)
+for each line makat:  
+  get line  
+  get stops along route  
+  transform line to spatial network  
+  blend stops along route (first order segments) to spatial network using 10 meter snapping tolarance  
+  blend other stops  (first order segments) using 10 meter snapping tolarance   
+  blend intersections using 0.1 meter snapping tolerance   
+in the map, we see the cuts in orange, the segments in light blue, the intersections in yellow and the stops in blue. you can turn the layers on and off to check the result.   
+```{r}
+# 10359-2-#
+line_with_all_cuts <- map(makats,function(x){
+  print(x)
+  line <- lines %>% filter(route_desc == x)
+  stops <- stops_routes %>% filter(route_desc == x)
+  line %>% 
+    as_sfnetwork() %>% 
+    st_network_blend(stops,10) %>% 
+    {
+      a = try(st_network_blend((.),stops_routes,10),silent = TRUE )
+      if(class(a) == "try-error"){
+        res <- (.)
+      }else{
+        res <- a
+      }
+      res
+    }%>%   
+    st_network_blend(intersections,0.1)
+})
+# vis of example
+line_with_all_cuts[[11]] %>% activate(nodes) %>% st_as_sf() -> cuts
+line_with_all_cuts[[11]] %>% activate(edges) %>% st_as_sf() -> liness
+m4 <- mapview(cuts,col.regions = "orange")
+m5 <- mapview(liness)
+m6 <- mapview(intersections,col.regions = "yellow")
+m7 <- mapview(stops_routes,col.regions = "blue")
+m8 <-  m5+m6+m7 + m4
+
+m8@map
+```
+
+## limitations  
+doesnt cut already used intersections  
+only beer sheva area  
+needs snapping parameter for type 2 segments  
+doesnt account for directions in snapping type 2 segments  
+  
+## next steps  
+creating tables  
+discussing joining different GTFSs  
