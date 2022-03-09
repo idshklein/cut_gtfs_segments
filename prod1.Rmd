@@ -1,0 +1,383 @@
+---
+title: "gtfs cut vertices"
+author: "Ido Klein"
+date: "18/01/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages and definations
+
+piping and data manipulation - {tidyverse}\
+geometry manipulation - {sf}, {lwgeom}, {nngeo}\
+network analysis - {sfnetworks}, {tidygraph}\
+gtfs loading - {gtfstools}\
+visualization - {mapview}\
+hebrew encoding
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(lwgeom)
+library(nngeo)
+library(sfnetworks)
+library(tidygraph)
+library(gtfstools)
+library(mapview)
+library(patchwork)
+library(job)
+Sys.setlocale(locale = "hebrew")
+```
+
+## loading gtfs from 7.7.2021 (takes a while)
+
+The {gtfstools} package allows for loading of an entire gtfs file. it takes a while but it is worthwhile because it is more clean.\
+in this stage, we perform the analysis on beersheva only
+
+```{r cache=TRUE}
+spo_gtfs <- read_gtfs("C:/Users/yehuda/Downloads/gtfs.zip",encoding = "UTF-8")
+```
+
+## beer sheva convex hull polygon
+
+filter all routes operated by dan beersheva\
+join trips, stop times and stops coords\
+create a multipoint enttity\
+convex hull
+
+```{r cache=TRUE}
+bs_pol <- spo_gtfs$routes %>% 
+  # at first, only for Dan Beer sheva
+  filter(agency_id == 32) %>% 
+  select(route_id,route_desc) %>% 
+  # join with trips
+  left_join(spo_gtfs$trips, by = "route_id") %>% 
+  left_join(spo_gtfs$stop_times, by = "trip_id") %>% 
+  distinct(stop_id) %>% 
+  left_join(spo_gtfs$stops, by = "stop_id") %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+  st_transform(2039) %>% 
+  summarise() %>% 
+  st_convex_hull() 
+```
+
+## get beer sheva gtfs
+bug - different dates - multiple makats. I choose only the first one. 
+```{r}
+bs_gtfs <- filter_by_sf(spo_gtfs,bs_pol %>% st_transform(4326))
+
+bs_lines <- get_trip_geometry(bs_gtfs) %>% 
+  left_join(bs_gtfs$trips, by = "trip_id") %>% 
+  left_join(bs_gtfs$routes, by = "route_id") %>% 
+  select(route_id,route_desc,shape_id)  %>% {
+    (.) %>% 
+      group_by(route_desc) %>% 
+      mutate(rn = row_number()) %>% 
+      filter(rn == 1)
+  } %>% st_transform(2039)
+m1 <- mapview(bs_lines,zcol = "route_desc")
+m1@map
+```
+
+## create intersections between lines
+
+intersections points between the lines are created by:\
+1. exploding all of the lines above to segments\
+2. subsetting to only distinct segments\
+3. parsing all distinct segments to a spatial network, that includes edges and nodes\
+the nodes are one source for intersections, however some of them are irrelevant (see stage 5)\
+4. adding intersections that are created by intersection of two segments without a connecting node.\
+this is somewhat problematic because it assumes we deal with a planar graph, and that means that bridges and tunnels will subdived segments.\
+5. smoothing segments - removing nodes that are connected to only 2 edges, making more uniform edges.\
+this eliminates nodes that were created in the lines explosion and are irrelevant for the analysis.
+
+```{r cache=TRUE}
+intersections <- 
+  # explode all lines
+  st_segments(bs_lines$geometry) %>% 
+  st_as_sf() %>% 
+  # get only distinct segments
+  distinct() %>% 
+  # parse as sfnetoworks object
+  as_sfnetwork() %>% 
+  # subdivide segments that intersect (assuming planar graph)
+  convert(to_spatial_subdivision) %>% 
+  # smooth useless nodes
+  convert(to_spatial_smooth) %>% 
+  st_as_sf() 
+m2 <- mapview(intersections)
+m2@map
+```
+
+## get relevant stops
+
+using the routes, trips, stop_times and stops tables, we create a layer where each stop connected to its line makat and to its place in the stops sequence.
+
+```{r cache=TRUE}
+stops_routes <- bs_gtfs$routes %>% 
+  # join change until getting to stops
+  left_join(bs_gtfs$trips, by = "route_id") %>% 
+  {
+    (.) %>% 
+      group_by(route_desc) %>% 
+      mutate(rn = row_number()) %>% 
+      filter(rn == 1)
+  } %>% 
+  # left_join(bs_gtfs$trips, by = "route_id") %>% 
+  left_join(bs_gtfs$stop_times, by = "trip_id") %>% 
+  left_join(bs_gtfs$stops,by = "stop_id") %>% 
+  # get only distinct stops per line
+  select(route_id,route_desc,shape_id,stop_id,stop_sequence,stop_lat,stop_lon)  %>% 
+  distinct() %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+  st_transform(2039)
+
+
+stops <- bs_gtfs$stops %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+  st_transform(2039)
+m3 <- mapview(stops_routes,zcol = "route_desc")
+m3@map
+```
+
+## create makats
+
+get all line makats in order to iterate over the lines and stop_routes
+
+```{r cache=TRUE}
+makats <- bs_lines$route_desc
+```
+
+## cutting the line
+
+using [st_network_blend](https://luukvdmeer.github.io/sfnetworks/reference/st_network_blend.html) as the main workhorse
+
+![](https://luukvdmeer.github.io/sfnetworks/reference/st_network_blend-1.png) for each line makat:\
+get line\
+get stops along route\
+transform line to spatial network\
+blend stops along route (first order segments) to spatial network using 10 meter snapping tolarance\
+blend other stops (first order segments) using 10 meter snapping tolarance\
+blend intersections using 0.1 meter snapping tolerance\
+in the map, we see the cuts in orange, the segments in light blue, the intersections in yellow and the stops in blue. you can turn the layers on and off to check the result.
+
+
+## new way - taking account of uncut segemnts
+bugs list:
+
+when blending a node into a network, it will be blended only once. 
+this disables the ability of the node to be added as one to the network, unless using st_split.
+st_split has a problem - it is not always stable. 
+bug solution is adding another point to the line in the location of the node
+this happens even if there is a line that is in the same location as the first line. 
+this makes sense, due to the fact that this is how snapping works. 
+```{r}
+pipe_message = function(.data, status) {message(status); .data}
+# should blend own stops in right only way - blend stop by stops, according to order/one sided buffer
+# new approach: 
+# segmentize the line
+# init line_segment_id = 1
+# init max_line_segment_id = length(segments)
+# for each first order stop: 
+#   for each segment in range line_segment:max_line_segment_id:
+#     line_segment_id ++
+#     check id point is snapped
+#     break if point is snapped
+map( makats[1],function(mak){
+  segments <- bs_lines %>% 
+    filter(route_desc == mak) %>% 
+    st_segments() %>% 
+    mutate(rn = row_number())
+  stops_new_method <- stops_routes %>% 
+    filter(route_desc == mak) %>% 
+    arrange(stop_sequence)
+  print(nrow(segments)*nrow(stops_new_method))
+  segment_minus_10 <- segments %>% 
+    st_buffer(-5.5,singleSide = TRUE) 
+  st_nearest_points(stops_new_method,segments)
+  
+  # res <- stops_new_method %>% 
+  #   st_intersection(segment_minus_10) %>% 
+  #   left_join(segments %>% as_tibble(),by = "rn") %>% 
+  #   mutate(dist = map2(geometry,result,~st_nearest_points(.x,.y)%>%
+  #                        `[[`(1)) %>% 
+  #            st_sfc(crs = 2039),
+  #          len = st_length(dist),
+  #          snapped = map(dist,~st_endpoint(.x) %>%
+  #                          `[[`(1)
+  #          ) %>% 
+  #            st_sfc(crs = 2039),
+  #          split1 = map2(result,snapped,~st_union(st_startpoint(.x),.y) %>% 
+  #                          st_cast("LINESTRING") %>% 
+  #                          `[[`(1))%>% 
+  #            st_sfc(crs = 2039),
+  #          split2 = map2(result,snapped,~st_union(.y,st_endpoint(.x)) %>% 
+  #                          st_cast("LINESTRING")) %>% 
+  #            st_sfc(crs = 2039))
+  # mak %>% print()
+  # stops_new_method %>% nrow() %>% print()
+  # res %>% nrow() %>% print()
+}) %>% 
+  `[[`(1) %>% 
+  st_sf() %>% 
+  slice(1:46) %>% 
+  plot()
+
+
+
+
+
+
+
+
+
+
+
+make_net <- function(x){
+  print(x)
+  res <- bs_lines %>% 
+    filter(route_desc == x) %>% 
+    # add notification whether stop belongs to line
+    as_sfnetwork(directed = TRUE) %>% 
+    pipe_message("made net") %>% 
+    st_network_blend(stops,10) %>% 
+    pipe_message("blended stops") %>% 
+    st_network_blend(intersections,0.1) %>% 
+    pipe_message("blended intersections") %>% 
+    {
+      eds <- (.) %>% 
+        activate(edges) %>% 
+        st_as_sf()    
+      nds <- (.) %>% 
+        activate(nodes) %>% 
+        st_as_sf()
+      neds <- eds %>% 
+        mutate(rn = row_number())  %>% 
+        st_split(nds) %>% 
+        st_collection_extract(type = "LINESTRING") %>% 
+        group_by(rn) %>% 
+        mutate(rn1 = row_number()) %>% 
+        arrange(rn,-rn1) %>% 
+        ungroup() %>% 
+        select(-rn1) %>% 
+        mutate(rn = row_number())  
+      # add better join method
+      neds %>% 
+        as_sfnetwork(directed = TRUE) %>% 
+        st_join(nds) %>% 
+        pipe_message("redid net") 
+    } %>% 
+    left_join(stops_routes %>%st_drop_geometry() %>% filter(route_desc == x) %>% select(-stop_sequence) %>% distinct(),
+              by = c("stop_id"))
+  return(res)
+}
+
+line_with_all_cuts1 <- map(makats,make_net)
+names(line_with_all_cuts1) <- makats
+# make_net("61002-1-1")
+
+```
+
+```{r}
+prod <- list()
+prod$stops <- bs_gtfs$stops %>% 
+  select(stop_id,stop_lon,stop_lat)
+prod$routes <- bs_gtfs$routes %>% 
+  select(route_id,route_desc) %>% 
+  separate(route_desc,c("mkt_line","mkt_direction","mkt_alternative"),"-")
+map(makats[1],~line_with_all_cuts1[[.x]] %>% 
+      mutate(rn = row_number()) %>% 
+      {
+        nds <- (.) %>% 
+          st_as_sf("nodes") %>% 
+          st_drop_geometry() %>% 
+          select(rn, stop_id,route_desc) %>% 
+          mutate(cut_type = ifelse(!is.na(route_desc),"first",
+                                   ifelse(!is.na(stop_id),"second","third")))
+        (.) %E>% 
+          left_join(nds,by = c("from"="rn")) %>% 
+          left_join(nds,by = c("to"="rn")) %>% 
+          mutate(distance_from_origin = as.numeric(cumsum(edge_length())),
+                 distance_from_origin = replace_na(lag(distance_from_origin),0))
+      } %>% 
+      mutate(segment_type = ifelse(cut_type.x == "third" | cut_type.y == "third", "third",
+                                   ifelse(cut_type.x =="second"|cut_type.y =="second","second","first")),
+             # second_col = ifelse(segment_type != "third",)
+      ) %>%
+      as_tibble()) %>% 
+  `[[`(1) %>% 
+  View()
+stops_routes %>%st_drop_geometry() %>% filter(route_desc == makats[1]) %>% select(stop_sequence) %>% distinct()
+```
+
+
+## dispose of it
+
+
+```{r}
+eds %>% 
+  mutate(rn = row_number())%>% 
+  slice(189:193)  %>% 
+  ggplot() + 
+  geom_sf() +
+  geom_sf_label(data = pts[189:194,] %>% mutate(rn1 = 189:194),
+                mapping = aes(label = rn1),
+                label.padding = unit(0.1, "lines"),
+                size = 2) + 
+  facet_wrap(~rn, nrow = 1)
+
+
+
+
+newer_net <-  
+  newer_net %>% activate(nodes) %>% st_as_sf() -> cuts
+newer_net %>% activate(edges) %>% st_as_sf() -> liness
+liness %>% 
+  st_distance(cuts) %>% 
+  apply(1,function(x){which(x<0.1)})
+
+liness[c(193,187:189),] %>% mapview()
+
+m4 <- mapview(cuts,col.regions = "orange")
+m5 <- mapview(liness)
+m6 <- mapview(intersections,col.regions = "yellow")
+m7 <- mapview(stops_routes,col.regions = "blue")
+m8 <-  m5+m6+m7 + m4
+
+
+pts <- newer_net %>% st_as_sf()
+lns <-   newer_net %>% activate(edges) %>% st_as_sf()
+lns %>% 
+  mutate(rn = row_number())%>% 
+  slice(189:196)  %>% 
+  ggplot() + 
+  geom_sf() +
+  geom_sf_label(data = pts[189:194,] %>% mutate(rn1 = 189:194),
+                mapping = aes(label = rn1),
+                label.padding = unit(0.1, "lines"),
+                size = 2) + 
+  facet_wrap(~rn, nrow = 1)
+
+
+lns[196,] %>% 
+  st_segments() %>%
+  mutate(start = st_startpoint(result)) %>% 
+  st_set_geometry("start") %>% 
+  st_join(pts,st_is_within_distance,dist=0.1) %>% 
+  mutate(q = cumsum(as.numeric(!is.na(.tidygraph_node_index)))) %>% 
+  group_by(q) %>% 
+  summarise() %>% 
+  st_line_merge() %>% 
+  as_sfnetwork() %>% 
+  st_as_sf() %>% 
+  mapview()
+mutate(rn = row_number()) %>% 
+  mapview(zcol = "rn")
+ggplot(aes(label = rn)) +
+  geom_sf_label()
+plot()
+plot()
+```

@@ -209,7 +209,7 @@ m8@map
 line_q <- lines %>% filter(route_desc == "10359-2-#")
 stops_q <- stops_routes %>% filter(route_desc == "10359-2-#")
 new_net <- line_q %>% 
-  as_sfnetwork() %>% 
+  as_sfnetwork(directed = F) %>% 
   st_network_blend(stops_q,10) %>% 
   {
     a = try(st_network_blend((.),stops_routes,10),silent = TRUE )
@@ -220,45 +220,29 @@ new_net <- line_q %>%
     }
     res
   }%>%   
-  st_network_blend(intersections,0.1)
-nds <- new_net %>% 
-  activate(nodes) %>% 
-  st_as_sf() 
+  st_network_blend(intersections,1)
 eds <- new_net %>% 
   activate(edges) %>% 
   st_as_sf()
+
+eds %>% mutate(rn = row_number())%>% slice(188:192)  %>% ggplot() + geom_sf() +geom_sf_label(data = pts[188:192,] %>% mutate(rn1 = 188:192),mapping = aes(label = rn1),label.padding = unit(0.1, "lines"),size = 2) + facet_wrap(~rn, nrow = 1)
+nds <- new_net %>% 
+  activate(nodes) %>% 
+  st_as_sf() 
 neds <- eds %>% 
   st_split(nds) %>% 
   st_collection_extract(type = "LINESTRING") %>% 
   mutate(rn = row_number())
 newer_net <- neds %>% 
-  as_sfnetwork() %>% 
+  as_sfnetwork(directed = F) %>% 
   st_join(nds) 
 pts <- newer_net %>% st_as_sf()
 lns <-   newer_net %>% activate(edges) %>% st_as_sf()
-mapview(lns[285,]) + pts
-qqq <- st_split(lns[195,],pts[191,])
-qqq %>% st_collection_extract(type = "LINESTRING") %>% pull(line)
-#   st_sf() %>% 
-#   st_cast("MULTILINESTRING") %>% 
-#   summarise()
-# 
-# 
-# 
-# ggccpp <- eds %>% 
-#   mutate(res1 = map(line,~st_split(.x,nds) %>% st_collection_extract(type = "LINESTRING")),
-#          res1class = map(res1,~class(.x[[1]])),
-#          res2 = map2(res1,res1class, function(x,y){
-#            if(y == "numeric"){
-#              st_sfc(x) %>% st_cast("MULTILINESTRING")
-#            }else{
-#              x %>% st_cast("MULTILINESTRING")
-#            }
-#          })) %>% 
-#   st_set_geometry("res2")
-# 
-# eds[192,"line"] %>% st_split(nds) %>% st_collection_extract(type = "LINESTRING") %>% summarise()
-# geom_collec <- map(eds$line,~st_split(.x,nds) %>% st_collection_extract(type = "LINESTRING"))
-# st_geometry_type(geom_collec[[192]])
+lns %>% mutate(rn = row_number())%>% slice(188:195)  %>% ggplot() + geom_sf() +geom_sf_label(data = pts[188:192,] %>% mutate(rn1 = 188:192),mapping = aes(label = rn1),label.padding = unit(0.1, "lines"),size = 2) + facet_wrap(~rn, nrow = 1)
+lns[195,] %>% st_segments() %>% mutate(start = st_startpoint(result)) %>% st_set_geometry("start") %>% st_join(pts,st_is_within_distance,dist=0.1) %>% mutate(q = cumsum(as.numeric(!is.na(.tidygraph_node_index)))) %>% group_by(q) %>% summarise() %>% plot()
+mapview(lns) + pts
+qqq <- st_split(lns[195,],st_nearest_points(lns[195,],pts[191,]) %>% st_cast("POINT") %>% `[`(2))
+qqq %>% st_collection_extract(type = "LINESTRING") 
+
 ```
 
