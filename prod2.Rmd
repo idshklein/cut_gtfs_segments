@@ -288,10 +288,10 @@ prod2
 final <- list()
 final$routes <- makats %>% 
   mutate(route_id=as.integer(route_id),
-         shape_id = as.integer(shape_id)) %>% 
+         shape_id = shape_id) %>% 
   select(route_id,shape_id,route_desc)
-st_x = function(x) st_coordinates(x)[,1]
-st_y = function(x) st_coordinates(x)[,2]
+st_x = function(x) round(st_coordinates(x)[,1],5)
+st_y = function(x) round(st_coordinates(x)[,2],5)
 final$cuts <- bind_rows(
   prod2 %>% ungroup() %>% 
     select(origin,geometry.x) %>% 
@@ -401,5 +401,27 @@ final$route_order <- tmp %>%
          third_order_seg_id = ifelse(has_third,third_order_seg_id,NA_integer_)) %>% 
   select(-has_second,-has_third)
 map(names(final),~write_csv(final[[.x]],paste0(.x,".csv")))
+```
+
+```{r}
+ new_model <- df_to_model(
+     list=names(final), envir=as.environment(final)
+)
+new_model %>% 
+  add_foreign_key("route_order","seg_UID","segments","seg_UID") %>%
+  add_foreign_key("first_order_cuts","from_cut","cuts","cut_id") %>% 
+  add_foreign_key("first_order_cuts","to_cut","cuts","cut_id") %>% 
+  add_foreign_key("second_order_cuts","from_cut","cuts","cut_id") %>% 
+  add_foreign_key("second_order_cuts","to_cut","cuts","cut_id") %>%
+  add_foreign_key("third_order_cuts","from_cut","cuts","cut_id") %>% 
+  add_foreign_key("third_order_cuts","to_cut","cuts","cut_id") %>% 
+  add_foreign_key("first_order_cuts","first_order_seg_id","route_order","first_order_seg_id") %>% 
+  add_foreign_key("second_order_cuts",c("first_order_seg_id","second_order_seg_id"),"route_order",c("first_order_seg_id","second_order_seg_id")) %>% 
+  add_foreign_key("third_order_cuts",c("first_order_seg_id","second_order_seg_id","third_order_seg_id"),"route_order",c("first_order_seg_id","second_order_seg_id","third_order_seg_id")) %>% 
+  add_foreign_key("route_order","shape_id","routes","shape_id") %>%
+  add_foreign_key("first_order_cuts","shape_id","routes","shape_id") %>%
+  add_foreign_key("second_order_cuts","shape_id","routes","shape_id") %>%
+  add_foreign_key("third_order_cuts","shape_id","routes","shape_id") %>%
+  model_relational_data()
 ```
 
