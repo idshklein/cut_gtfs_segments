@@ -272,16 +272,13 @@ prod2 <- prod1 %>%
   mutate(counter_seg_first = cumsum(counter_first)) %>% 
   ungroup() %>% 
   group_by(shape_id,counter_seg_first) %>% 
-  # mutate(counter_seg_second = cumsum(counter_second),
-  #        has_second = sum(counter_second) > 0,
-  #        counter_seg_third = cumsum(counter_second + counter_third),
-  #        has_third = sum(counter_second + counter_third)>0) 
   mutate(counter_seg_second = cumsum(counter_second),
          has_second = sum(counter_second) > 0) %>% 
   ungroup() %>% 
   group_by(shape_id,counter_seg_first,counter_seg_second) %>% 
   mutate(counter_seg_third = cumsum(counter_third),
-         has_third = sum(counter_third)>0) 
+         has_third = sum(counter_third)>0) %>% 
+  mutate(geometry.x = st_transform(geometry.x, 4326))
 prod2
 ```
  
@@ -310,9 +307,14 @@ final$cuts <- bind_rows(
     st_sf() %>% 
     rename(cut_id = destination)
 ) %>% distinct() %>% 
-  mutate(lon = st_x(geom),
+  mutate(intersection = str_detect(cut_id,"inter"),
+         start = str_detect(cut_id,"start"),
+         end = str_detect(cut_id,"end"),
+         type = ifelse(intersection,"inter",ifelse(start,"start",ifelse(end,"end","stop"))),
+         lon = st_x(geom),
          lat = st_y(geom)) %>% 
-  st_drop_geometry()
+  st_drop_geometry() %>% 
+  select(cut_id,type,lon,lat)
 
 final$segments <- prod2 %>% 
   ungroup() %>% 
@@ -324,59 +326,62 @@ final$segments <- prod2 %>%
 
 
 tmp <- prod2 %>%
-  left_join(final$segments, by = c("geometry.x"="geometry"))
+  left_join(final$segments %>% st_as_sf(wkt="geometry",crs = 4326), by = c("geometry.x"="geometry"))
 final$first_order_cuts <- tmp %>% 
   ungroup() %>% 
-  select(first_order_seg_id = counter_seg_first,
+  select(shape_id,
+         first_order_seg_id = counter_seg_first,
          from_cut = origin,
-         to_cut = destination,
-         shape_id,
-         seg_UID,
-         distance_from_origin = cs,
-         counter,
-         has_second,
-         has_third) %>% 
-  mutate(serial_cut_number = ifelse(has_second|has_third, NA_integer_,counter),
-         seg_UID = ifelse(has_second|has_third, NA_integer_,seg_UID)) %>% 
-  select(-counter,-has_second,-has_third) %>% 
+         to_cut = destination) %>% 
+         # seg_UID,
+         # distance_from_origin = cs,
+         # counter,
+         # has_second,
+         # has_third) %>% 
+  # mutate(serial_cut_number = ifelse(has_second|has_third, NA_integer_,counter),
+         # seg_UID = ifelse(has_second|has_third, NA_integer_,seg_UID)) %>% 
+  # select(-counter,-has_second,-has_third) %>% 
   group_by(shape_id,first_order_seg_id) %>% 
   mutate(from_cut = first(from_cut),
             to_cut = last(to_cut),
-            distance_from_origin = first(distance_from_origin)) %>% 
+            # distance_from_origin = first(distance_from_origin)
+         ) %>% 
   distinct()
 final$second_order_cuts <- tmp %>% 
   ungroup() %>% 
   filter(has_second) %>% 
-  select(first_order_seg_id = counter_seg_first,
+  select(shape_id,
+         first_order_seg_id = counter_seg_first,
          second_order_seg_id = counter_seg_second,
          from_cut = origin,
-         to_cut = destination,
-         shape_id,
-         seg_UID,
-         distance_from_origin = cs,
-         counter,
-         has_third) %>% 
-  mutate(serial_cut_number = ifelse(has_third, NA_integer_,counter),
-         seg_UID = ifelse(has_third, NA_integer_,seg_UID)) %>% 
-  select(-counter,-has_third) %>% 
+         to_cut = destination) %>% 
+         # seg_UID,
+         # distance_from_origin = cs,
+         # counter,
+         # has_third) %>% 
+  # mutate(serial_cut_number = ifelse(has_third, NA_integer_,counter),
+         # seg_UID = ifelse(has_third, NA_integer_,seg_UID)) %>% 
+  # select(-counter,-has_third) %>% 
   distinct() %>% 
   group_by(shape_id,first_order_seg_id,second_order_seg_id) %>% 
   mutate(from_cut = first(from_cut),
             to_cut = last(to_cut),
-            distance_from_origin = first(distance_from_origin)) %>% 
+            # distance_from_origin = first(distance_from_origin)
+         ) %>% 
   distinct()  
 final$third_order_cuts <- tmp %>% 
   ungroup() %>% 
   filter(has_third) %>% 
-  select(first_order_seg_id = counter_seg_first,
+  select(shape_id,
+         first_order_seg_id = counter_seg_first,
          second_order_seg_id = counter_seg_second,
          third_order_seg_id = counter_seg_third,
          from_cut = origin,
          to_cut = destination,
-         shape_id,
-         seg_UID,
-         distance_from_origin = cs,
-         serial_cut_number =counter,
+
+         # seg_UID,
+         # distance_from_origin = cs,
+         # serial_cut_number =counter,
          has_second) %>% 
   mutate(second_order_seg_id = ifelse(has_second,second_order_seg_id,NA_integer_)) %>% 
   select(-has_second) 
@@ -387,6 +392,9 @@ final$route_order <- tmp %>%
          first_order_seg_id= counter_seg_first,
          second_order_seg_id= counter_seg_second,
          third_order_seg_id= counter_seg_third,
+         seg_UID,
+         distance_from_origin = cs,
+         serial_cut_number =counter,
          has_second,
          has_third) %>% 
   mutate(second_order_seg_id = ifelse(has_second,second_order_seg_id,NA_integer_),
