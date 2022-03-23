@@ -17,7 +17,7 @@ network analysis - {sfnetworks}, {tidygraph}\
 gtfs loading - {gtfstools}\
 visualization - {mapview}\
 hebrew encoding
-```{r load libraries and setup workspace}
+```{r load libraries and setup workspace, message=FALSE, warning=FALSE,results = FALSE}
 library(tidyverse)
 library(sf)
 library(lwgeom)
@@ -30,8 +30,8 @@ Sys.setlocale(locale = "hebrew")
 ```
 
 ## loading GTFS, filtering Beer Sheva
-
-```{r load gtfs}
+first, we filter the Israeli gtfs file from 7.7.2021 to only include the lines passing through beersheva
+```{r load gtfs, message=FALSE, warning=FALSE,results = FALSE}
 spo_gtfs <- read_gtfs("C:/Users/yehuda/Downloads/gtfs.zip",encoding = "UTF-8")
 bs_pol <- spo_gtfs$routes %>% 
   # at first, only for Dan Beer sheva
@@ -50,8 +50,20 @@ bs_gtfs <- filter_by_sf(spo_gtfs,bs_pol)
 ```
 
 ## create building blocks
-
-```{r building clocks}
+using the gtfs elements, we create three building block for the analysis: 
+1. bs_lines - line geometries of the shapes of each shape_id  
+2. bs_stops - point geometries of all stops
+3. intersections - point geometries of all the times bs_lines intesect with each other
+the creation of the first two is quite trivial. the intersections are created the following way:
+- exploding all lines  
+- finding only distinct segments  
+- turning them into a spatial graph
+- subdividing the network by finding shared implicit nodes inside edges
+- un-exploding the network by smoothing the edges (removing 2-degree nodes)
+we have 2 helper tables:
+1. joined - joining all shape_ids for each stop, by finding which of them are 10 meters to the right of the line
+1. joined_inter - joining all shape_ids for each intersection, by finding which of them are 10 meters to the right of the line
+```{r building clocks, message=FALSE, warning=FALSE,results = FALSE}
 bs_lines <- get_trip_geometry(bs_gtfs) %>% 
   # join trips to their geometry
   left_join(bs_gtfs$trips, by = "trip_id") %>% 
@@ -97,8 +109,19 @@ joined_inter <- intersections %>%
 ```
 
 ## processing each shape_id
-
-```{r processing shape_ids}
+this is the main workhorse.  
+in this process, 
+we take each shape_id  
+turn it into a spatial network  
+subdividing the network to include self intersections  
+blending the intersections into the network  
+inserting stops into the relevant edges and creating multiple sfnetworks  
+binding all graphs together in a way that keep the order of the nodes according to their location in the line
+adding a cumulative sum of the length of the segments to get the distance from origin  
+adding stop and intersection ids  
+adding start point and end point ids  
+removing those nodes that are internal and nameless  
+```{r processing shape_ids, message=FALSE, warning=FALSE,results = FALSE}
 res <- map(1:nrow(bs_lines),function(.x){
   print(bs_lines[.x,]$shape_id)
   # filter relevant stops and intersections
@@ -122,7 +145,7 @@ res <- map(1:nrow(bs_lines),function(.x){
     st_buffer(-10,singleSide = T) %>% 
     st_intersects(one,sparse = F) %>% 
     apply( 1,which)
-  # create sfnetwork for each segemnt
+  # create sfnetwork for each segment
   nets <- net %E>%
     st_as_sf() %>% 
     mutate(rn = row_number(),
@@ -212,6 +235,7 @@ res <- map(1:nrow(bs_lines),function(.x){
 ```
 
 ## map of products
+
 ```{r map of lines and cuts}
 names(res) <- bs_lines$shape_id
 with_shapes <- map(names(res),~res[[.x]] %>% mutate(shape_id = .x)) %>% bind_rows()
@@ -221,13 +245,31 @@ m1@map
 ```
 
 ## stops in routes - segmenting 1,2,3 order cuts
+we remove the israel rail lines due to the fact they belong to a different network
+stops_in_routes includes all of the stops in each shape_id  
+
+prod1 classifies the cuts according to their order, the following way:  
+for each shape_id:  
+  for each row:  
+    classify the order of the cut:  
+      first order - start,end, or stop in shape_id  
+      second order - stop not in shape_id  
+      third order - intersections  
+
+
+prod2 classifies the segments according to their order, the following way:  
+for each shape_id:  
+  for each row:  
+    if one of the cuts is third order - segment is third order  
+    if no cut is third order but one is second order - segment is second order  
+    if no cut is second ot third order - segment is first order  
 ```{r order cuts}
 stops_in_routes <- bs_gtfs$routes %>% 
   left_join(bs_gtfs$trips,by = "route_id") %>% 
   left_join(bs_gtfs$stop_times,by = "trip_id") %>% 
   select(route_id,route_desc,shape_id,stop_id,agency_id) %>% 
   distinct()  
-# remove train - useless
+# remove israel rail - useless
 to_remove <- stops_in_routes %>% filter(agency_id== 2) %>% distinct(shape_id) %>% pull(shape_id)
 with_shapes_2 <- with_shapes %>% filter(!shape_id %in% to_remove)
 
@@ -240,7 +282,7 @@ with_shapes_3 <- with_shapes_2 %>%
          cs = replace_na(lag(cumsum(length)),0)) %>% 
   left_join(stops_in_routes,by = c("origin" = "stop_id","shape_id")) %>% 
   left_join(stops_in_routes,by = c("destination" = "stop_id","shape_id"))
-# getting relevent makatim
+# getting relevent makatim without israel rail
 makats <- bs_gtfs$routes %>% 
   filter(!agency_id== 2) %>% 
   left_join(bs_gtfs$trips,by = "route_id") %>% 
@@ -283,8 +325,15 @@ prod2
 ```
  
 ## creating tables
-
-```{r to tables}
+taking all materials and processing them into 7 tables:  
+cuts - all cuts ids, type (start, end, stop, intersection) and location  
+routes - route_id,route_desc(line-direction-altenative),shape_id for relevant shapes  
+segments - all unique geometries with uid, length and wkt geometry
+first_order_cuts(should be changed to first_order_segments) - for each shape_id, all first order segments ids, and their start and end cuts
+second_order_cuts(should be changed to second_order_segments) - for each shape_id, all second order segments ids by their containing first order segment id, and their start and end cuts
+third_order_cuts(should be changed to second_order_segments) - for each shape_id, all third order segments ids by their containing first and second order segment id, and their start and end cuts
+route order - for each shape id, the order of the segments, a reference to the unique segment id, and distance from the line origin
+```{r to tables, message=FALSE, warning=FALSE,results = FALSE}
 final <- list()
 final$routes <- makats %>% 
   mutate(route_id=as.integer(route_id),
@@ -333,18 +382,9 @@ final$first_order_cuts <- tmp %>%
          first_order_seg_id = counter_seg_first,
          from_cut = origin,
          to_cut = destination) %>% 
-         # seg_UID,
-         # distance_from_origin = cs,
-         # counter,
-         # has_second,
-         # has_third) %>% 
-  # mutate(serial_cut_number = ifelse(has_second|has_third, NA_integer_,counter),
-         # seg_UID = ifelse(has_second|has_third, NA_integer_,seg_UID)) %>% 
-  # select(-counter,-has_second,-has_third) %>% 
   group_by(shape_id,first_order_seg_id) %>% 
   mutate(from_cut = first(from_cut),
-            to_cut = last(to_cut),
-            # distance_from_origin = first(distance_from_origin)
+            to_cut = last(to_cut)
          ) %>% 
   distinct()
 final$second_order_cuts <- tmp %>% 
@@ -355,18 +395,10 @@ final$second_order_cuts <- tmp %>%
          second_order_seg_id = counter_seg_second,
          from_cut = origin,
          to_cut = destination) %>% 
-         # seg_UID,
-         # distance_from_origin = cs,
-         # counter,
-         # has_third) %>% 
-  # mutate(serial_cut_number = ifelse(has_third, NA_integer_,counter),
-         # seg_UID = ifelse(has_third, NA_integer_,seg_UID)) %>% 
-  # select(-counter,-has_third) %>% 
   distinct() %>% 
   group_by(shape_id,first_order_seg_id,second_order_seg_id) %>% 
   mutate(from_cut = first(from_cut),
-            to_cut = last(to_cut),
-            # distance_from_origin = first(distance_from_origin)
+            to_cut = last(to_cut)
          ) %>% 
   distinct()  
 final$third_order_cuts <- tmp %>% 
@@ -378,10 +410,6 @@ final$third_order_cuts <- tmp %>%
          third_order_seg_id = counter_seg_third,
          from_cut = origin,
          to_cut = destination,
-
-         # seg_UID,
-         # distance_from_origin = cs,
-         # serial_cut_number =counter,
          has_second) %>% 
   mutate(second_order_seg_id = ifelse(has_second,second_order_seg_id,NA_integer_)) %>% 
   select(-has_second) 
@@ -403,7 +431,9 @@ final$route_order <- tmp %>%
 map(names(final),~write_csv(final[[.x]],paste0(.x,".csv")))
 ```
 
-```{r}
+## creating a data model of the tables, including all foreign keys
+
+```{r data model, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, results=false}
  new_model <- df_to_model(
      list=names(final), envir=as.environment(final)
 )
