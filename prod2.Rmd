@@ -375,7 +375,8 @@ final$segments <- prod2 %>%
 
 
 tmp <- prod2 %>%
-  left_join(final$segments %>% st_as_sf(wkt="geometry",crs = 4326), by = c("geometry.x"="geometry"))
+  mutate(geometry.x = map_chr(geometry.x,st_as_text)) %>% 
+  left_join(final$segments, by = c("geometry.x"="geometry"))
 final$first_order_cuts <- tmp %>% 
   ungroup() %>% 
   select(shape_id,
