@@ -33,20 +33,21 @@ Sys.setlocale(locale = "hebrew")
 first, we filter the Israeli gtfs file from 7.7.2021 to only include the lines passing through beersheva
 ```{r load gtfs, message=FALSE, warning=FALSE,results = FALSE}
 spo_gtfs <- read_gtfs("C:/Users/yehuda/Downloads/gtfs.zip",encoding = "UTF-8")
-bs_pol <- spo_gtfs$routes %>% 
-  # at first, only for Dan Beer sheva
-  filter(agency_id == 32) %>% 
-  select(route_id,route_desc) %>% 
-  # join with trips
-  left_join(spo_gtfs$trips, by = "route_id") %>% 
-  left_join(spo_gtfs$stop_times, by = "trip_id") %>% 
-  distinct(stop_id) %>% 
-  left_join(spo_gtfs$stops, by = "stop_id") %>% 
-  st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
-  summarise() %>% 
-  st_convex_hull() 
+# bs_pol <- spo_gtfs$routes %>% 
+#   # at first, only for Dan Beer sheva
+#   filter(agency_id == 32) %>% 
+#   select(route_id,route_desc) %>% 
+#   # join with trips
+#   left_join(spo_gtfs$trips, by = "route_id") %>% 
+#   left_join(spo_gtfs$stop_times, by = "trip_id") %>% 
+#   distinct(stop_id) %>% 
+#   left_join(spo_gtfs$stops, by = "stop_id") %>% 
+#   st_as_sf(coords = c("stop_lon","stop_lat"),crs = 4326) %>% 
+#   summarise() %>% 
+#   st_convex_hull() 
 
-bs_gtfs <- filter_by_sf(spo_gtfs,bs_pol)
+# bs_gtfs <- filter_by_sf(spo_gtfs,bs_pol)
+bs_gtfs <- spo_gtfs
 ```
 
 ## create building blocks
@@ -123,114 +124,125 @@ adding start point and end point ids
 removing those nodes that are internal and nameless  
 ```{r processing shape_ids, message=FALSE, warning=FALSE,results = FALSE}
 res <- map(1:nrow(bs_lines),function(.x){
-  print(bs_lines[.x,]$shape_id)
-  # filter relevant stops and intersections
-  one <- joined %>% filter(shape_id == bs_lines[.x,]$shape_id)
-  two <- joined_inter%>% filter(shape_id == bs_lines[.x,]$shape_id)
-  # blend intersections to sfnetwork
-  net <- bs_lines[.x,] %>% 
-    as_sfnetwork(directed = T) %>% 
-    convert(to_spatial_subdivision) %>%
-    st_network_blend(two)
-  # filter segments where there are stops
-  rel_rows <- net %E>%
-    st_as_sf() %>% 
-    mutate(rn = row_number()) %>% 
-    st_buffer(-10,singleSide = T) %>% 
-    filter(apply(st_intersects(geometry,one,sparse = F),1,any)) 
-  # get stops ids in order to blenf into network
-  rel_idx <- net %E>%
-    st_as_sf() %>% 
-    mutate(rn = row_number()) %>% 
-    st_buffer(-10,singleSide = T) %>% 
-    st_intersects(one,sparse = F) %>% 
-    apply( 1,which)
-  # create sfnetwork for each segment
-  nets <- net %E>%
-    st_as_sf() %>% 
-    mutate(rn = row_number(),
-           idx = rel_idx) %>% 
-    filter(rn %in% rel_rows$rn) %>% 
-    mutate(
-      # create an sfnetwork for each segment according to row number
-      net1 = map2(geometry,rn, ~.x %>% 
-                         st_sfc(crs = 2039) %>% 
-                         st_sf() %>% 
-                         as_sfnetwork(directed = T) %E>% 
-                         mutate(rn = .y)),
-           # blend stops into each sfnetwork
-           net2 = map2(net1,idx, function(x,y){
-             st_network_blend(x,one[y,]) %>% 
-               mutate(rn2 = row_number())
-           })) %>% 
-    pull(net2)
-  # get all joined net stops
-  stops <- bind_rows(map(nets,~.x %N>% st_as_sf())) %>% 
-    filter(!is.na(stop_id)) %>% 
-    distinct()
-  # bind all graphs together, including those segments without stops
-  final_net <- net %E>%
-    mutate(rn = row_number()) %>%
-    filter(!rn %in% rel_rows$rn) %E>%
-    bind_graphs(bind_graphs(nets)) %>%
-    # convert to sfnetwork
-    as_sfnetwork(edges_as_lines = T,directed = T) %E>% 
-    st_as_sf() %>%
-    # arrange by order
-    arrange(rn,rn2) %>% 
-    as_sfnetwork(directed = T)
-  route <- final_net %E>% 
-    st_as_sf() %>% 
-    mutate(cs = cumsum(st_length(geometry))) 
-  # create cuts
-  cuts <- final_net %>% 
-    st_join(stops) %>%
-    st_join(two) %>% 
-    mutate(rn = row_number()) %>% 
-    as_tibble() %>% 
-    as_tibble() %>%
-    select(geometry,stop_id,inter_id,rn)
-  # process route and cuts
-  phase_1 <- route %>%
-    # join all cuts
-    left_join(cuts,by = c("from" = "rn")) %>%
-    left_join(cuts,by = c("to" = "rn")) %>%
-    # fill all shape_ids to prevent errors
-    fill(shape_id,.direction = "downup") %>%
-    # give each origin and destination an id: stop id if stop, intersection id if intersection, start\end if edges
-    mutate(origin = ifelse(!is.na(stop_id.x),stop_id.x,ifelse(!is.na(inter_id.x),inter_id.x,NA)),
-           destination = ifelse(!is.na(stop_id.y),stop_id.y,ifelse(!is.na(inter_id.y),inter_id.y,NA)),
-           origin = ifelse(row_number() == 1,paste0("start_",shape_id),origin),
-           destination = ifelse(row_number() == nrow(.),paste0("end_",shape_id),destination)) %>%
-    select(origin,destination,from,to) %>%
-    fill(origin) %>%
-    fill(destination,.direction = "up") %>%
-    # preserve order
-    mutate(lag1 = lag(origin),
-           lag2 = lag(destination),
-           counter =coalesce(ifelse(origin == lag1 & destination == lag2,0,1),1) %>% cumsum()) %>% 
-    select(-lag1,-lag2)
-  # join created lines, some have no named edge
-  phase_2 <- phase_1 %>%
-    group_by(origin,destination,counter) %>%
-    summarise(do_union=T)
-  # prevent bugs if no multilinestring
-  phase_21 <- phase_2 %>%
-    filter(st_geometry_type(geometry.x) == "MULTILINESTRING")
-  if(nrow(phase_21) == 0){
-    phase_3 <- phase_2
-  }else{
-    phase_3 <- bind_rows(phase_2 %>%
-                           filter(!st_geometry_type(geometry.x) == "MULTILINESTRING"),
-                         phase_2 %>%
-                           filter(st_geometry_type(geometry.x) == "MULTILINESTRING") %>%
-                           st_line_merge())
-  }
-  phase_3 %>%
-    ungroup() %>%
-    arrange(counter) %>%
-    # st_buffer(-10,singleSide = T) %>%
-    mutate(rn3 = row_number())
+  out <- tryCatch(
+    {print(bs_lines[.x,]$shape_id)
+      # filter relevant stops and intersections
+      one <- joined %>% filter(shape_id == bs_lines[.x,]$shape_id)
+      two <- joined_inter%>% filter(shape_id == bs_lines[.x,]$shape_id)
+      # blend intersections to sfnetwork
+      net <- bs_lines[.x,] %>% 
+        as_sfnetwork(directed = T) %>% 
+        convert(to_spatial_subdivision) %>%
+        st_network_blend(two)
+      # filter segments where there are stops
+      rel_rows <- net %E>%
+        st_as_sf() %>% 
+        mutate(rn = row_number()) %>% 
+        st_buffer(-10,singleSide = T) %>% 
+        filter(apply(st_intersects(geometry,one,sparse = F),1,any)) 
+      # get stops ids in order to blenf into network
+      rel_idx <- net %E>%
+        st_as_sf() %>% 
+        mutate(rn = row_number()) %>% 
+        st_buffer(-10,singleSide = T) %>% 
+        st_intersects(one,sparse = F) %>% 
+        apply( 1,which)
+      # create sfnetwork for each segment
+      nets <- net %E>%
+        st_as_sf() %>% 
+        mutate(rn = row_number(),
+               idx = rel_idx) %>% 
+        filter(rn %in% rel_rows$rn) %>% 
+        mutate(
+          # create an sfnetwork for each segment according to row number
+          net1 = map2(geometry,rn, ~.x %>% 
+                        st_sfc(crs = 2039) %>% 
+                        st_sf() %>% 
+                        as_sfnetwork(directed = T) %E>% 
+                        mutate(rn = .y)),
+          # blend stops into each sfnetwork
+          net2 = map2(net1,idx, function(x,y){
+            st_network_blend(x,one[y,]) %>% 
+              mutate(rn2 = row_number())
+          })) %>% 
+        pull(net2)
+      # get all joined net stops
+      stops <- bind_rows(map(nets,~.x %N>% st_as_sf())) %>% 
+        filter(!is.na(stop_id)) %>% 
+        distinct()
+      # bind all graphs together, including those segments without stops
+      final_net <- net %E>%
+        mutate(rn = row_number()) %>%
+        filter(!rn %in% rel_rows$rn) %E>%
+        bind_graphs(bind_graphs(nets)) %>%
+        # convert to sfnetwork
+        as_sfnetwork(edges_as_lines = T,directed = T) %E>% 
+        st_as_sf() %>%
+        # arrange by order
+        arrange(rn,rn2) %>% 
+        as_sfnetwork(directed = T)
+      route <- final_net %E>% 
+        st_as_sf() %>% 
+        mutate(cs = cumsum(st_length(geometry))) 
+      # create cuts
+      cuts <- final_net %>% 
+        st_join(stops) %>%
+        st_join(two) %>% 
+        mutate(rn = row_number()) %>% 
+        as_tibble() %>% 
+        as_tibble() %>%
+        select(geometry,stop_id,inter_id,rn)
+      # process route and cuts
+      phase_1 <- route %>%
+        # join all cuts
+        left_join(cuts,by = c("from" = "rn")) %>%
+        left_join(cuts,by = c("to" = "rn")) %>%
+        # fill all shape_ids to prevent errors
+        fill(shape_id,.direction = "downup") %>%
+        # give each origin and destination an id: stop id if stop, intersection id if intersection, start\end if edges
+        mutate(origin = ifelse(!is.na(stop_id.x),stop_id.x,ifelse(!is.na(inter_id.x),inter_id.x,NA)),
+               destination = ifelse(!is.na(stop_id.y),stop_id.y,ifelse(!is.na(inter_id.y),inter_id.y,NA)),
+               origin = ifelse(row_number() == 1,paste0("start_",shape_id),origin),
+               destination = ifelse(row_number() == nrow(.),paste0("end_",shape_id),destination)) %>%
+        select(origin,destination,from,to) %>%
+        fill(origin) %>%
+        fill(destination,.direction = "up") %>%
+        # preserve order
+        mutate(lag1 = lag(origin),
+               lag2 = lag(destination),
+               counter =coalesce(ifelse(origin == lag1 & destination == lag2,0,1),1) %>% cumsum()) %>% 
+        select(-lag1,-lag2)
+      # join created lines, some have no named edge
+      phase_2 <- phase_1 %>%
+        group_by(origin,destination,counter) %>%
+        summarise(do_union=T)
+      # prevent bugs if no multilinestring
+      phase_21 <- phase_2 %>%
+        filter(st_geometry_type(geometry.x) == "MULTILINESTRING")
+      if(nrow(phase_21) == 0){
+        phase_3 <- phase_2
+      }else{
+        phase_3 <- bind_rows(phase_2 %>%
+                               filter(!st_geometry_type(geometry.x) == "MULTILINESTRING"),
+                             phase_2 %>%
+                               filter(st_geometry_type(geometry.x) == "MULTILINESTRING") %>%
+                               st_line_merge())
+      }
+      phase_3 %>%
+        ungroup() %>%
+        arrange(counter) %>%
+        # st_buffer(-10,singleSide = T) %>%
+        mutate(rn3 = row_number())},
+      error=function(cond) {
+        message("Here's the original error message:")
+        message(cond)
+        # Choose a return value in case of error
+        return(NA)},
+        finally = print(paste("line number",.x))
+      
+  )
+  return(out)
+  
 })
 ```
 
@@ -238,11 +250,26 @@ res <- map(1:nrow(bs_lines),function(.x){
 
 ```{r map of lines and cuts}
 names(res) <- bs_lines$shape_id
-with_shapes <- map(names(res),~res[[.x]] %>% mutate(shape_id = .x)) %>% bind_rows()
+resna <- res[which(is.na(res))]
+resnotna <- res[!which(is.na(res))]
+with_shapes <- map(names(resnotna),~resnotna[[.x]] %>% mutate(shape_id = .x)) %>% bind_rows()
 starts <- with_shapes %>% st_startpoint() %>% st_sf()
-m1 <- mapview(with_shapes) + mapview(starts)
-m1@map
+# m1 <- mapview(with_shapes) + mapview(starts)
+# m1@map
+gc()
+save.image("all_israel_pitstop.RData")
 ```
+
+```{r cleanup}
+rm(res)
+rm(resnotna)
+rm(spo_gtfs)
+rm(joined_inter)
+rm(starts)
+gc()
+```
+
+
 
 ## stops in routes - segmenting 1,2,3 order cuts
 we remove the israel rail lines due to the fact they belong to a different network
@@ -250,30 +277,33 @@ stops_in_routes includes all of the stops in each shape_id
 
 prod1 classifies the cuts according to their order, the following way:  
 for each shape_id:  
-  for each row:  
-    classify the order of the cut:  
-      first order - start,end, or stop in shape_id  
-      second order - stop not in shape_id  
-      third order - intersections  
+for each row:  
+classify the order of the cut:  
+first order - start,end, or stop in shape_id  
+second order - stop not in shape_id  
+third order - intersections  
 
 
 prod2 classifies the segments according to their order, the following way:  
 for each shape_id:  
-  for each row:  
-    if one of the cuts is third order - segment is third order  
-    if no cut is third order but one is second order - segment is second order  
-    if no cut is second ot third order - segment is first order  
+for each row:  
+if one of the cuts is third order - segment is third order  
+if no cut is third order but one is second order - segment is second order  
+if no cut is second ot third order - segment is first order  
 ```{r order cuts}
+# remove missing routes because of algorithm
+routes_to_remove <- names(resna)
 stops_in_routes <- bs_gtfs$routes %>% 
   left_join(bs_gtfs$trips,by = "route_id") %>% 
   left_join(bs_gtfs$stop_times,by = "trip_id") %>% 
   select(route_id,route_desc,shape_id,stop_id,agency_id) %>% 
+  filter(!shape_id %in% routes_to_remove) %>% 
   distinct()  
 # remove israel rail - useless
 to_remove <- stops_in_routes %>% filter(agency_id== 2) %>% distinct(shape_id) %>% pull(shape_id)
-with_shapes_2 <- with_shapes %>% filter(!shape_id %in% to_remove)
+with_shapes <- with_shapes %>% filter(!shape_id %in% to_remove)
 
-with_shapes_3 <- with_shapes_2 %>% 
+with_shapes <- with_shapes %>% 
   # for each shape_id, add cumulative sum of length to know distance in line
   mutate(length = st_length(geometry.x)) %>% 
   as_tibble() %>% 
@@ -283,14 +313,15 @@ with_shapes_3 <- with_shapes_2 %>%
   left_join(stops_in_routes,by = c("origin" = "stop_id","shape_id")) %>% 
   left_join(stops_in_routes,by = c("destination" = "stop_id","shape_id"))
 # getting relevent makatim without israel rail
+
 makats <- bs_gtfs$routes %>% 
-  filter(!agency_id== 2) %>% 
+  filter(!agency_id== 2,route_id %in% unique(stops_in_routes$route_id) ) %>% 
   left_join(bs_gtfs$trips,by = "route_id") %>% 
   select(route_id,route_desc,shape_id) %>% 
   distinct()
 
 prod1 <- makats %>% 
-  left_join(with_shapes_3,by = "shape_id") %>%
+  left_join(with_shapes,by = "shape_id") %>%
   select(-route_id,-route_id.x,-route_id.y,-agency_id.x,-agency_id.y,-rn3) %>% 
   mutate(start = str_detect(origin, "start"),
          end = str_detect(destination, "end"),
@@ -305,11 +336,11 @@ prod1 <- makats %>%
 prod2 <- prod1 %>% 
   select(-c(route_desc.x:is_dest_intersection)) %>% 
   mutate(segment_type = ifelse(orig_cut == "third" | dest_cut == "third", "third",
-                                   ifelse(orig_cut =="second"|dest_cut =="second","second","first")),
+                               ifelse(orig_cut =="second"|dest_cut =="second","second","first")),
          counter_first = orig_cut == "first",
          counter_second = orig_cut == "second",
          counter_third = orig_cut == "third"
-         ) %>% 
+  ) %>% 
   group_by(shape_id) %>% 
   mutate(counter_seg_first = cumsum(counter_first)) %>% 
   ungroup() %>% 
@@ -321,9 +352,9 @@ prod2 <- prod1 %>%
   mutate(counter_seg_third = cumsum(counter_third),
          has_third = sum(counter_third)>0) %>% 
   mutate(geometry.x = st_transform(geometry.x, 4326))
-prod2
+save.image("all_israel_pitstop2.RData")
 ```
- 
+
 ## creating tables
 taking all materials and processing them into 7 tables:  
 cuts - all cuts ids, type (start, end, stop, intersection) and location  
@@ -334,6 +365,11 @@ second_order_cuts(should be changed to second_order_segments) - for each shape_i
 third_order_cuts(should be changed to second_order_segments) - for each shape_id, all third order segments ids by their containing first and second order segment id, and their start and end cuts
 route order - for each shape id, the order of the segments, a reference to the unique segment id, and distance from the line origin
 ```{r to tables, message=FALSE, warning=FALSE,results = FALSE}
+load("all_israel_pitstop2.RData")
+rm(bs_gtfs)
+rm(prod1)
+rm(with_shapes)
+
 final <- list()
 final$routes <- makats %>% 
   mutate(route_id=as.integer(route_id),
@@ -377,6 +413,7 @@ final$segments <- prod2 %>%
 tmp <- prod2 %>%
   mutate(geometry.x = map_chr(geometry.x,st_as_text)) %>% 
   left_join(final$segments, by = c("geometry.x"="geometry"))
+rm(prod2)
 final$first_order_cuts <- tmp %>% 
   ungroup() %>% 
   select(shape_id,
@@ -385,8 +422,8 @@ final$first_order_cuts <- tmp %>%
          to_cut = destination) %>% 
   group_by(shape_id,first_order_seg_id) %>% 
   mutate(from_cut = first(from_cut),
-            to_cut = last(to_cut)
-         ) %>% 
+         to_cut = last(to_cut)
+  ) %>% 
   distinct()
 final$second_order_cuts <- tmp %>% 
   ungroup() %>% 
@@ -399,8 +436,8 @@ final$second_order_cuts <- tmp %>%
   distinct() %>% 
   group_by(shape_id,first_order_seg_id,second_order_seg_id) %>% 
   mutate(from_cut = first(from_cut),
-            to_cut = last(to_cut)
-         ) %>% 
+         to_cut = last(to_cut)
+  ) %>% 
   distinct()  
 final$third_order_cuts <- tmp %>% 
   ungroup() %>% 
@@ -435,8 +472,8 @@ map(names(final),~write_csv(final[[.x]],paste0(.x,".csv")))
 ## creating a data model of the tables, including all foreign keys
 
 ```{r data model, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, results=false}
- new_model <- df_to_model(
-     list=names(final), envir=as.environment(final)
+new_model <- df_to_model(
+  list=names(final), envir=as.environment(final)
 )
 new_model %>% 
   add_foreign_key("route_order","seg_UID","segments","seg_UID") %>%
