@@ -1,12 +1,13 @@
-library(tidyverse)
-library(sf)
-library(lwgeom)
-library(nngeo)
-library(sfnetworks)
-library(tidygraph)
-library(gtfstools)
-library(mapview)
-library(job)
+pacman::p_load(tidyverse,sf,lwgeom,sfnetworks,tidygraph,gtfstools,mapview,job,furrr,nngeo,assertr)
+# library(tidyverse)
+# library(sf)
+# library(lwgeom)
+# library(nngeo)
+# library(sfnetworks)
+# library(tidygraph)
+# library(gtfstools)
+# library(mapview)
+# library(job)
 early_gtfs <- read_gtfs("data/gtfs_010121.zip",encoding = "UTF-8") %>%  filter_by_agency_id("32")
 late_gtfs <- read_gtfs("data/gtfs_010122.zip",encoding = "UTF-8")%>%  filter_by_route_id(early_gtfs$routes$route_id)
 all_process <- function(gtfsq){
@@ -360,15 +361,57 @@ all_process <- function(gtfsq){
 
 job({early_gtfs_processed = all_process(early_gtfs)},import = "all")
 job({late_gtfs_processed = all_process(late_gtfs)},import = "all")
+# check for NA
 early_gtfs_processed$segments %>% 
-  full_join(late_gtfs_processed$segments,by = "geometry") %>% 
-  # left_join(early_gtfs_processed$route_order,by = c("seg_UID.x"="seg_UID")) %>% 
-  # left_join(late_gtfs_processed$route_order,by = c("seg_UID.y"="seg_UID")) %>% 
-  filter(is.na(seg_UID.y))
+  assert(function(x)!is.na(x),everything())
+early_gtfs_processed$cuts %>% 
+  assert(function(x)!is.na(x),everything())
+early_gtfs_processed$routes %>% 
+  assert(function(x)!is.na(x),everything())
+early_gtfs_processed$route_order %>% 
+  assert(function(x)!is.na(x),shape_id,serial_cut_number,seg_UID,distance_from_origin)
+early_gtfs_processed$first_order_cuts %>% 
+  assert(function(x)!is.na(x),everything())
+early_gtfs_processed$second_order_cuts %>% 
+  assert(function(x)!is.na(x),everything())
+early_gtfs_processed$third_order_cuts %>% 
+  assert(function(x)!is.na(x),-second_order_seg_id)
 
-early_gtfs_processed$segments %>% 
-  select(geometry) %>% 
-  distinct()
+late_gtfs_processed$segments %>% 
+  assert(function(x)!is.na(x),everything())
+late_gtfs_processed$cuts %>% 
+  assert(function(x)!is.na(x),everything())
+late_gtfs_processed$routes %>% 
+  assert(function(x)!is.na(x),everything())
+late_gtfs_processed$route_order %>% 
+  assert(function(x)!is.na(x),shape_id,serial_cut_number,seg_UID,distance_from_origin)
+late_gtfs_processed$first_order_cuts %>% 
+  assert(function(x)!is.na(x),everything())
+late_gtfs_processed$second_order_cuts %>% 
+  assert(function(x)!is.na(x),everything())
+late_gtfs_processed$third_order_cuts %>% 
+  assert(function(x)!is.na(x),-second_order_seg_id)
+# length sum is a bit different, in the milimetric level
+early_gtfs_processed$route_order %>% 
+  left_join(early_gtfs_processed$segments, by = "seg_UID") %>% 
+  group_by(shape_id) %>% 
+  mutate(cs = cumsum(lag(length) %>% coalesce(0))) %>% 
+  filter(abs(distance_from_origin - cs)>0.01) %>% 
+  st_as_sf(wkt = "geometry",crs=4326) %>% 
+  mapview()
 
-early_gtfs$shapes %>% st_as_sf(coords = c("shape_pt_lon","shape_pt_lat"),crs=4326) %>% st_set_precision(0.000000000000001)
-early_gtfs$shapes$shape_pt_lat
+join_between_segments <- early_gtfs_processed$segments %>% 
+  full_join(late_gtfs_processed$segments,by = "geometry") 
+join_between_segments %>% 
+  filter(is.na(seg_UID.x)|is.na(seg_UID.y)) 
+  mutate(q=is.na(seg_UID.x)) %>% 
+  st_as_sf(wkt = "geometry",crs=4326) %>% 
+  mapview(zcol = "q")
+
+
+early_gtfs_processed$second_order_cuts %>% 
+  ungroup() %>% 
+  add_count(from_cut,to_cut) %>% 
+  filter(n >1)
+early_gtfs_processed$route_order
+
